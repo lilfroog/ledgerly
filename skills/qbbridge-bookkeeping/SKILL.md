@@ -132,6 +132,19 @@ looked empty when I glanced at it" -- query it explicitly for the date
 range you're about to post into, every time, even if you believe this is
 the first time this statement has been processed.
 
+**This cuts both ways.** It is just as easy to wrongly *exclude* a real
+line as it is to wrongly duplicate one -- e.g. seeing a similarly-named
+recurring charge (same vendor, close amount) on a *different* date in
+prior history, and assuming today's statement line is "already posted"
+without checking. A missing charge and a duplicated charge are the same
+class of bug: an unverified assumption about what's already in
+QuickBooks. Never exclude a statement line from posting because it
+*resembles* an existing entry -- only exclude it after `qb_check_duplicate`
+(or an equivalent direct query) confirms an exact date+amount match for
+*that specific line*. If you catch yourself reasoning "this looks like
+one I've already done," treat that as the trigger to go verify, not as
+the verification itself.
+
 ## 6. Reporting and confirmation
 
 Before posting anything, summarize for the user:
