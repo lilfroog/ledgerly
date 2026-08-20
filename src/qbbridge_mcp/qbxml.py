@@ -190,6 +190,47 @@ def build_add_request(txn_type, request_id, account, txn_date, lines,
     )
 
 
+def build_journal_entry_add_request(request_id, txn_date, lines, refnum=None,
+                                     header_memo=None, is_adjustment=None):
+    """
+    Builds a JournalEntryAddRq. `lines` is an ordered list of dicts, each
+    {"kind": "debit"|"credit", "account", "amount", "memo": optional,
+    "entity": optional}. Confirmed against the QBXML SDK reference schema
+    (qbxmlops130.xml): JournalEntryAdd takes an interleaved sequence of
+    JournalDebitLine/JournalCreditLine elements, each optionally carrying
+    its own EntityRef -- real entries in this file carry a customer/vendor
+    EntityRef on sales lines (e.g. the Lightspeed sync's own catch-all
+    customer), so that must be preserved line-by-line, not just at the
+    header level.
+    """
+    header = (
+        "<TxnDate>" + txn_date + "</TxnDate>"
+        + _xml_element("RefNumber", refnum)
+        + _xml_element("Memo", header_memo)
+        + ("<IsAdjustment>" + ("true" if is_adjustment else "false") + "</IsAdjustment>" if is_adjustment is not None else "")
+    )
+    lines_xml = ""
+    for line in lines:
+        tag = "Journal" + line["kind"].capitalize() + "Line"
+        entity_xml = (
+            "<EntityRef><FullName>" + _esc(line["entity"]) + "</FullName></EntityRef>"
+            if line.get("entity") else ""
+        )
+        lines_xml += (
+            "<" + tag + ">"
+            "<AccountRef><FullName>" + _esc(line["account"]) + "</FullName></AccountRef>"
+            "<Amount>" + ("%.2f" % line["amount"]) + "</Amount>"
+            + _xml_element("Memo", line.get("memo"))
+            + entity_xml +
+            "</" + tag + ">"
+        )
+    return (
+        '<JournalEntryAddRq requestID="' + str(request_id) + '"><JournalEntryAdd>'
+        + header + lines_xml +
+        "</JournalEntryAdd></JournalEntryAddRq>"
+    )
+
+
 def wrap_envelope(fragments, on_error="continueOnError"):
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n<?qbxml version="16.0"?>\n<QBXML>\n'

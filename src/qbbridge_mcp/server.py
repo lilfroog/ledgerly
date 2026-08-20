@@ -22,11 +22,13 @@ from mcp.server.fastmcp import FastMCP
 
 from .qbxml import (
     QuickBooksSession, QuickBooksError, TxnLine,
-    build_add_request, build_query_request, wrap_envelope, parse_txn_blocks, extract,
+    build_add_request, build_query_request, build_journal_entry_add_request,
+    wrap_envelope, parse_txn_blocks, extract,
 )
 from .undo import (
     RunLog, revert_run, reverse_for_add, reverse_for_vendor_add,
-    reverse_for_vendor_deactivate, reverse_for_line_mod, reverse_for_recreate,
+    reverse_for_vendor_deactivate, reverse_for_line_mod, reverse_for_journal_recreate,
+    reverse_for_recreate,
 )
 
 mcp = FastMCP("qbbridge")
@@ -71,9 +73,19 @@ def qb_company_info() -> dict:
 @mcp.tool()
 def qb_list_accounts() -> list[dict]:
     """Lists all accounts in the chart of accounts (name, type, active,
-    balance). Use this to confirm an account name exists exactly before
-    trying to post to it -- QuickBooks rejects an AccountRef to a
-    nonexistent or misspelled account."""
+    balance, total_balance). Use this to confirm an account name exists
+    exactly before trying to post to it -- QuickBooks rejects an
+    AccountRef to a nonexistent or misspelled account.
+
+    balance vs total_balance: for a parent account with subaccounts,
+    "balance" is that account's OWN activity only (excludes subaccounts);
+    "total_balance" is the rolled-up figure including every subaccount.
+    When checking whether a restatement changed a parent account's real
+    total, use total_balance -- "balance" will look like it dropped even
+    when nothing left the account tree, since it only reflects direct
+    postings and moving activity into a new subaccount is exactly what a
+    category split does.
+    """
     resp = _session.send(wrap_envelope(['<AccountQueryRq requestID="1" />'], on_error="stopOnError"))
     out = []
     for block in parse_txn_blocks(resp, "AccountRet"):
@@ -82,6 +94,7 @@ def qb_list_accounts() -> list[dict]:
             "type": extract(r"<AccountType>([^<]+)</AccountType>", block),
             "active": extract(r"<IsActive>([^<]+)</IsActive>", block) == "true",
             "balance": extract(r"<Balance>([^<]+)</Balance>", block),
+            "total_balance": extract(r"<TotalBalance>([^<]+)</TotalBalance>", block),
         })
     return out
 
@@ -235,6 +248,133 @@ def qb_add_transaction(
         run_log.close()
 
     return {"txn_id": txn_id, "run_id": run_id, "run_log_path": log_path}
+
+
+def _query_journal_entry_snapshot(txn_id):
+    """
+    Fetches one JournalEntry's full current state: header (txn_date,
+    refnum, header_memo, is_adjustment) plus every line in original order
+    (kind, line_id, account, amount, memo, entity). Used both to validate a
+    split before writing and to capture the "before" snapshot a delete
+    needs to be undoable.
+    """
+    q = build_query_request("JournalEntry", 1, txn_id=txn_id, include_line_items=True)
+    resp = _session.send(wrap_envelope([q]))
+    blocks = parse_txn_blocks(resp, "JournalEntryRet")
+    if not blocks:
+        raise ValueError("JournalEntry " + txn_id + " not found")
+    block = blocks[0]
+
+    header = re.split(r"<Journal(?:Debit|Credit)Line>", block, maxsplit=1)[0]
+    is_adj_raw = extract(r"<IsAdjustment>([^<]+)</IsAdjustment>", header)
+
+    lines = []
+    for m in re.finditer(r"<Journal(Debit|Credit)Line>(.*?)</Journal\1Line>", block, re.S):
+        kind, sub = m.group(1).lower(), m.group(2)
+        lines.append({
+            "kind": kind,
+            "line_id": extract(r"<TxnLineID>([^<]+)</TxnLineID>", sub),
+            "account": extract(r"<FullName>([^<]+)</FullName>", sub),
+            "amount": float(extract(r"<Amount>([^<]+)</Amount>", sub)),
+            "memo": extract(r"<Memo>([^<]+)</Memo>", sub),
+            "entity": extract(r"<EntityRef>.*?<FullName>([^<]+)</FullName>", sub),
+        })
+
+    return {
+        "txn_date": extract(r"<TxnDate>([^<]+)</TxnDate>", header),
+        "refnum": extract(r"<RefNumber>([^<]+)</RefNumber>", header),
+        "header_memo": extract(r"<Memo>([^<]+)</Memo>", header),
+        "is_adjustment": (is_adj_raw == "true") if is_adj_raw is not None else None,
+        "lines": lines,
+    }
+
+
+@mcp.tool()
+def qb_split_journal_entry_line(
+    txn_id: str,
+    target_line_id: str,
+    splits: list[dict],
+    expected_company_file: Optional[str] = None,
+) -> dict:
+    """
+    Replaces one lump-sum JournalDebitLine/JournalCreditLine with several
+    lines across different accounts, without changing the entry's date,
+    other lines, or total. Built specifically for restating a lump-sum
+    sales line into per-category lines from an external source (e.g. a POS
+    category report) -- not a general-purpose JE editor.
+
+    splits: [{"account": str, "amount": float, "memo": str|None}, ...] --
+    must sum to exactly the target line's current amount (checked here;
+    QuickBooks would otherwise happily accept a mismatched total). Splits
+    inherit the target line's EntityRef unless a split explicitly sets its
+    own "entity" key.
+
+    Mechanism: QBXML's JournalEntryModRq (confirmed against the QBXML SDK
+    reference schema) only supports JournalLineMod on lines that already
+    exist -- there is no way to add a new line to an existing JE. So this
+    deletes the whole entry and recreates it with the target line replaced
+    by `splits`, everything else identical. The undo log captures a full
+    pre-delete snapshot, so revert recreates the original entry exactly
+    (as a new TxnID -- QuickBooks does not allow restoring a deleted
+    transaction's original TxnID).
+    """
+    _check_expected_file(expected_company_file)
+    if len(splits) < 2:
+        raise ValueError("splits must have at least 2 entries -- otherwise there's nothing to split")
+
+    snapshot = _query_journal_entry_snapshot(txn_id)
+    target = next((l for l in snapshot["lines"] if l["line_id"] == target_line_id), None)
+    if target is None:
+        raise ValueError("line " + target_line_id + " not found on JournalEntry " + txn_id)
+
+    total_split = round(sum(s["amount"] for s in splits), 2)
+    if total_split != round(target["amount"], 2):
+        raise ValueError(
+            "splits sum to %.2f but target line's current amount is %.2f -- refusing to post a mismatched split"
+            % (total_split, target["amount"])
+        )
+
+    new_lines = [l for l in snapshot["lines"] if l["line_id"] != target_line_id] + [
+        {
+            "kind": target["kind"],
+            "account": s["account"],
+            "amount": s["amount"],
+            "memo": s.get("memo"),
+            "entity": s.get("entity", target.get("entity")),
+        }
+        for s in splits
+    ]
+
+    run_log, run_id, log_path = _new_run_log()
+    try:
+        rev_qbxml, kind = reverse_for_journal_recreate(snapshot)
+        run_log.record(
+            "delete JournalEntry " + txn_id + " (pre-split snapshot)", rev_qbxml, kind,
+        )
+        _session.send_single(
+            wrap_envelope(
+                ['<TxnDelRq requestID="1"><TxnDelType>JournalEntry</TxnDelType><TxnID>' + txn_id + '</TxnID></TxnDelRq>'],
+                on_error="stopOnError",
+            ),
+            "TxnDelRs",
+        )
+
+        add_fragment = build_journal_entry_add_request(
+            1, snapshot["txn_date"], new_lines,
+            refnum=snapshot.get("refnum"), header_memo=snapshot.get("header_memo"),
+            is_adjustment=snapshot.get("is_adjustment"),
+        )
+        _, body, _ = _session.send_single(wrap_envelope([add_fragment], on_error="stopOnError"), "JournalEntryAddRs")
+        new_txn_id = extract(r"<TxnID>([^<]+)</TxnID>", body)
+
+        run_log.record(
+            "recreate JournalEntry as " + new_txn_id + " with line " + target_line_id + " split into " + str(len(splits)) + " lines",
+            *reverse_for_add("JournalEntry", new_txn_id),
+        )
+    finally:
+        run_log.close()
+
+    return {"run_id": run_id, "run_log_path": log_path, "old_txn_id": txn_id, "new_txn_id": new_txn_id}
 
 
 @mcp.tool()

@@ -21,7 +21,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from .qbxml import build_add_request, wrap_envelope, TxnLine
+from .qbxml import build_add_request, build_journal_entry_add_request, wrap_envelope, TxnLine
 
 
 class RunLog:
@@ -200,6 +200,23 @@ def reverse_for_line_mod(txn_type, txn_id, edit_seq, line_id, original_account, 
         on_error="stopOnError",
     )
     return qbxml, "mod", edit_seq
+
+
+def reverse_for_journal_recreate(before):
+    """
+    Undoes a JournalEntry delete-and-recreate (see
+    qb_split_journal_entry_line) by rebuilding the entry from a full
+    snapshot captured immediately before deletion. `before` must have:
+    txn_date, refnum (or None), header_memo (or None), is_adjustment (or
+    None), lines (list of dicts with kind/account/amount/memo/entity).
+    """
+    fragment = build_journal_entry_add_request(
+        1, before["txn_date"], before["lines"],
+        refnum=before.get("refnum"), header_memo=before.get("header_memo"),
+        is_adjustment=before.get("is_adjustment"),
+    )
+    qbxml = wrap_envelope([fragment], on_error="stopOnError")
+    return qbxml, "recreate"
 
 
 def reverse_for_recreate(txn_type, before):
